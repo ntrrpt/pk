@@ -20,9 +20,7 @@ import tomllib
 todo:
     - port range (1234-1244, 1555-1600/udp)
     - execute commands instead of opening ports
-    - fgsfds
     - make service examples (nssm, systemd --user)
-    - open/close ports race condition
 """
 
 
@@ -169,17 +167,15 @@ def netsh(
     fw = f"{SUDO} netsh advfirewall firewall"
 
     for protocol in protocols:
-        protocol = protocol.upper()
-
         allow_name = f'name="!_alw_{protocol}-{port}"'
         block_name = f'name="!_blk_{protocol}-{port}"'
 
         allow_cmd = f"add rule {allow_name} dir=in action=allow \
-            protocol={protocol} localport={port}"
+            protocol={protocol.upper()} localport={port}"
 
         ip_range = NetshIPRangeBuilder(allowed)
         block_cmd = f"add rule {block_name} dir=in action=block \
-            {ip_range.build()} protocol={protocol} localport={port}"
+            {ip_range.build()} protocol={protocol.upper()} localport={port}"
 
         # recreate allow rule
         sp_exec(f"{fw} delete rule {allow_name}")
@@ -187,12 +183,12 @@ def netsh(
 
         if block:
             # create block rule
-            log.info(f"[block] {protocol} {port}")
+            log.info(f"[block] {port}/{protocol}")
             sp_exec(f"{fw} {block_cmd}", True)
 
         else:
             # remove block rule (allow)
-            log.info(f"[allow] {protocol} {port}")
+            log.info(f"[allow] {port}/{protocol}")
             sp_exec(f"{fw} delete rule {block_name}")
 
 
@@ -241,10 +237,10 @@ def iptables(
         iptables_rm(allow_name, chain)
 
         if not block:
-            log.info(f"[allow] {protocol} {port}")
+            log.info(f"[allow] {port}/{protocol}")
             continue
 
-        log.info(f"[block] {protocol} {port}")
+        log.info(f"[block] {port}/{protocol}")
 
         if allowed:
             sp_exec(
@@ -276,7 +272,7 @@ def check():
 def server(port):
     global client_timeout
 
-    log.info(f"[lisening] {port}")
+    log.info(f"[lisening] {port}/udp")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("", port))
