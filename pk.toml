@@ -6,6 +6,6 @@ chain = 'DOCKER-USER' # for linux docker containers
 expires = 300
 
 [vnc] 
-knocks = [5555, 5678, 1111]
+knocks = [6666, 5678, 1111]
 ports = [5900]
 expires = 1500
