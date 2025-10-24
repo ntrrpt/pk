@@ -1,0 +1,11 @@
+[cpp]
+knocks = [1234, 5678, 4444]
+ports = [3923, '3921/tcp']
+allowed = ['192.168.0.0/16'] # allow lan
+chain = 'DOCKER-USER' # for linux docker containers
+expires = 300
+
+[vnc] 
+knocks = [5555, 5678, 1111]
+ports = [5900]
+expires = 1500
