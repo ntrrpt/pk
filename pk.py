@@ -352,23 +352,23 @@ def remove(ports: list):
 def client(ip: str, services: list = [], timeout: int = 0):
     data = b"\x00"
     gate = time.time() + timeout
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     while True:
         for svc in services:
             cs = CONFIG[svc]
 
             for port in cs["knocks"]:
-                sock.sendto(data, (ip, port))
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.sendto(data, (ip, port))
+
                 log.info(f"[send] {svc} => {ip}:{port} ")
+
                 time.sleep(1)
 
             time.sleep(5)
 
         if time.time() > gate:
             break
-
-    sock.close()
 
 
 if __name__ == "__main__":
@@ -537,9 +537,9 @@ if __name__ == "__main__":
     ## check binded knocks
 
     for port in ALL_KNOCKS:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             try:
-                s.bind(("", port))
+                sock.bind(("", port))
             except OSError as e:
                 die(f"cannot bind {port}/udp: {e}")
 
