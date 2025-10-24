@@ -106,9 +106,11 @@ class NetshIPRangeBuilder:
         return self._format_ranges_for_netsh(forbidden)
 
 
-def die(reason: str = "", code: int = 0):
-    reason = str(reason)
+def die(reason: str | int = 0, code: int = 0):
+    if isinstance(reason, int):
+        sys.exit(reason)
 
+    reason = str(reason)
     if reason:
         log.error(reason)
 
@@ -549,6 +551,16 @@ if __name__ == "__main__":
     if ar.remove:
         remove(CONFIG)
         die()
+
+    #########################
+    ## check binded knocks
+
+    for port in ALL_KNOCKS:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            try:
+                s.bind(("", port))
+            except OSError as e:
+                die(f"cannot bind {port}/udp: {e}")
 
     #########################
     ## initial ports blocking
