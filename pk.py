@@ -17,27 +17,12 @@ from typing import List, Tuple
 import tomllib
 
 """
-knocking with pk:
-    config:
-        [cpp]
-        knocks = [1234, 5678, 4444]
-        ports = [3923, '3921/tcp']
-
-    command:
-        python3 pk.py -c config.toml -i <ip> -s vnc
-
-knocking with nmap (for bash):
-    knock() { 
-        nping --udp --count 1 --data-length 1 --dest-port $1 <ip>
-    }
-
-    sq() {
-        for num in 1234, 5678, 4444; do knock "$num"; done;
-    }
-
-    sqq() {
-        while true; do sq; sleep 10; done;
-    }
+todo:
+    - port range (1234-1244, 1555-1600/udp)
+    - execute commands instead of opening ports
+    - fgsfds
+    - make service examples (nssm, systemd --user)
+    - open/close ports race condition
 """
 
 
@@ -106,7 +91,7 @@ class NetshIPRangeBuilder:
         return self._format_ranges_for_netsh(forbidden)
 
 
-def die(reason: str | int = 0, code: int = 0):
+def die(reason=0, code: int = 0):
     if isinstance(reason, int):
         sys.exit(reason)
 
@@ -214,8 +199,8 @@ def netsh(
 def iptables_rm(comm: str, chain: str = "INPUT"):  # chk: bool = False):
     global SUDO
     fw = f"{SUDO} iptables"
-    ip_l, _ = sp_exec(f"{fw} -L {chain} --line-numbers", True)
-    for line in ip_l.split("\n"):
+    ipt_list, _ = sp_exec(f"{fw} -L {chain} --line-numbers", True)
+    for line in ipt_list.split("\n"):
         rule = line.split()
         if (
             len(rule) >= 3
@@ -392,8 +377,8 @@ def client(ip: str, services: list = [], timeout: int = 0):
 
 if __name__ == "__main__":
     OS = platform.system()
-    CONFIG = {}
     CLIENT_KNOCKS = {}
+    CONFIG = {}
     SUDO = ""
 
     #########################
@@ -577,13 +562,16 @@ if __name__ == "__main__":
     block_ports()
 
     #########################
-    ## unlocking knocks
+    ## starting server
 
     for port in ALL_KNOCKS:
         port_set(port, ["udp"])
 
         T = Thread(target=server, args=(port,), daemon=True)
         T.start()
+
+    #########################
+    ## main loop (check for expired services)
 
     try:
         while True:
