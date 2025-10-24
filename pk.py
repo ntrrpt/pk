@@ -537,9 +537,6 @@ if __name__ == "__main__":
         case _:
             die(f"platform {OS} is not supported")
 
-    ip_range = NetshIPRangeBuilder("192.168.*.*")
-    die(ip_range.build())
-
     #########################
     ## get all knocks from config
 
