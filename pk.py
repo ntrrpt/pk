@@ -18,8 +18,7 @@ import tomllib
 
 """
 todo:
-    - port range (1234-1244, 1555-1600/udp)
-    - execute commands instead of opening ports
+    - ip in config
     - make service examples (nssm, systemd --user)
 """
 
@@ -89,46 +88,52 @@ class NetshIPRangeBuilder:
         return self._format_ranges_for_netsh(forbidden)
 
 
-def die(reason=0, code: int = 0):
+def die(reason: str | int = 0, code: int | None = None):
     if isinstance(reason, int):
         sys.exit(reason)
 
-    reason = str(reason)
+    reason = str(reason).strip()
     if reason:
         log.error(reason)
 
     sys.exit(code or int(bool(reason)))
 
 
-def parse_port(port: str | int):
-    """
-    3923 => (3923, ['tcp', 'udp'])
-    '3923/udp' => (3923, ['udp'])
-    """
+def expand_ports(ports: str | list) -> List[Tuple[int, list]]:
+    if isinstance(ports, str):
+        ports = [p.strip() for p in ports.split(",") if p.strip()]
 
-    protocols = ["tcp", "udp"]
+    port_map = {}
 
-    if isinstance(port, int):
-        return port, protocols
+    for item in ports:
+        if isinstance(item, int):
+            item = str(item)
 
-    if isinstance(port, str):
-        spl = port.split("/")
+        if "/" in item:
+            range_part, proto = item.split("/", 1)
+            protos = [proto]
+        else:
+            range_part = item
+            protos = ["tcp", "udp"]
 
-        if len(spl) != 2:
-            die(f"port {port!r} is invalid (len({spl}) != 2)")
+        if "-" in range_part:
+            start, end = map(int, range_part.split("-"))
+            ports_expanded = range(start, end + 1)
+        else:
+            ports_expanded = [int(range_part)]
 
-        if spl[1].lower() not in protocols:
-            die(f"{spl[1]!r} is invalid protocol")
+        for p in ports_expanded:
+            if p not in port_map:
+                port_map[p] = set()
+            port_map[p].update(protos)
 
-        if not spl[0].isdigit():
-            die(f"{spl[0]!r} is not a integer")
-
-        return int(spl[0]), [spl[1]]
-
-    die(f"not string or integer: {port}")
+    return [
+        (p, sorted(port_map[p], key=lambda proto: proto != "tcp"))
+        for p in sorted(port_map)
+    ]
 
 
-def sp_exec(cmd: str | list, ex_handle: bool = False):
+def sp_exec(cmd: str | list, chk: bool = False) -> None | Tuple[str, str]:
     log.debug(cmd)
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
@@ -145,22 +150,21 @@ def sp_exec(cmd: str | list, ex_handle: bool = False):
         )
         return p.stdout, p.stderr
     except sp.CalledProcessError as e:
-        if ex_handle:
+        if chk:
             cmd_fmt = " ".join(cmd)
-            log.error(f"failed cmd, are you admin?: {cmd_fmt!r}")
-            log.error(e)
-            sys.exit(1)
-        pass
+            die(f"failed cmd, are you admin?\ncmd: {cmd_fmt!r}\nex: {e}")
+        return None
 
 
 def netsh(
-    port: int,
+    port: int | str,
     protocols: list = ["tcp", "udp"],
     allowed: list = [],
     chain: str = "**NOT USED**",
 ):
     global SUDO
 
+    port = int(port)
     block = port < 0
     port = abs(port)
 
@@ -192,7 +196,7 @@ def netsh(
             sp_exec(f"{fw} delete rule {block_name}")
 
 
-def iptables_rm(comm: str, chain: str = "INPUT"):  # chk: bool = False):
+def iptables_rm(comm: str, chain: str = "INPUT"):
     global SUDO
     fw = f"{SUDO} iptables"
     ipt_list, _ = sp_exec(f"{fw} -L {chain} --line-numbers", True)
@@ -213,13 +217,14 @@ def iptables_rm(comm: str, chain: str = "INPUT"):  # chk: bool = False):
 
 
 def iptables(
-    port: int,
+    port: int | str,
     protocols: list = ["tcp", "udp"],
     allowed: list = [],
     chain: str = "INPUT",
 ):
     global SUDO
 
+    port = int(port)
     block = port < 0
     port = abs(port)
 
@@ -231,8 +236,6 @@ def iptables(
 
         fw = f"{SUDO} iptables -p {protocol} --dport {port}"
 
-        ip_range = " ".join([f"-s {x}" for x in allowed])
-
         iptables_rm(block_name, chain)
         iptables_rm(allow_name, chain)
 
@@ -243,6 +246,7 @@ def iptables(
         log.info(f"[block] {port}/{protocol}")
 
         if allowed:
+            ip_range = " ".join([f"-s {x}" for x in allowed])
             sp_exec(
                 f"{fw} -m comment --comment {allow_name} -I {chain} 1 -j ACCEPT {ip_range}",
                 True,
@@ -254,17 +258,23 @@ def iptables(
 
 
 def check():
-    for svc in CONFIG:
-        cs = CONFIG[svc]
+    for svc, cs in CONFIG.items():
         if cs["timeout"] and cs["timeout"] < time.time():
-            ports = ", ".join(map(str, cs["ports"]))
-            log.warning(f"[expired] {ports!r}")
+            if cs["ports"]:
+                ports = ", ".join(map(str, cs["ports"]))
+                log.warning(f"[expired] {svc}: {ports!r}")
 
-            for i in cs["ports"]:
-                port, protocols = parse_port(i)
-                port_set(
-                    -port, protocols=protocols, chain=cs["chain"], allowed=cs["allowed"]
-                )
+                for port in cs["ports"]:
+                    port_set(
+                        -port[0],
+                        protocols=port[1],
+                        chain=cs["chain"],
+                        allowed=cs["allowed"],
+                    )
+
+            for cmd in cs["cmd_close"]:
+                log.warning(f"[expired] {svc}: {cmd!r}")
+                sp_exec(cmd)
 
             CONFIG[svc]["timeout"] = 0
 
@@ -287,7 +297,8 @@ def server(port):
         now = time.time()
 
         # clean old attempts
-        knocks = [k for k in knocks if now - k[1] < (ar.timeout or 999999999)]
+        if ar.timeout:
+            knocks = [k for k in knocks if now - k[1] < ar.timeout]
 
         knocks.append((port, now))
         CLIENT_KNOCKS[ip] = knocks
@@ -295,30 +306,33 @@ def server(port):
         # seq checking
         seq = [k[0] for k in knocks]
 
-        for svc in CONFIG:
-            cs = CONFIG[svc]
+        for svc, cs in CONFIG.items():
             if seq[-len(cs["knocks"]) :] == cs["knocks"]:
                 log.info(f"[valid] {ip} => {svc}")
                 CLIENT_KNOCKS[ip] = []  # reset after success attempt
 
                 if not cs["timeout"]:
-                    ports = ", ".join(map(str, cs["ports"]))
-                    log.warning(f"[opening] {ports!r} for {cs['expires']}s")
+                    if cs["ports"]:
+                        ports = ", ".join(map(str, cs["ports"]))
+                        log.warning(f"[opening] {ports!r} for {cs['expires']}s")
 
-                    for i in cs["ports"]:
-                        _port, protocols = parse_port(i)
-                        port_set(
-                            _port,
-                            protocols=protocols,
-                            chain=cs["chain"],
-                            allowed=cs["allowed"],
-                        )
+                        for _port in cs["ports"]:
+                            port_set(
+                                _port[0],
+                                protocols=_port[1],
+                                chain=cs["chain"],
+                                allowed=cs["allowed"],
+                            )
+
+                    for cmd in cs["cmd_open"]:
+                        log.warning(f"[opening] exec: {cmd!r}")
+                        sp_exec(cmd)
 
                 CONFIG[svc]["timeout"] = now + cs["expires"]
 
 
 def remove(ports: list):
-    def del_port(action: str, protocol: str, port: int, chain: str = "INPUT"):
+    def del_port(port: int, protocol: str, action: str, chain: str = "INPUT"):
         log.info(f"[rm] {action}_{protocol}-{port}")
 
         match OS:
@@ -329,22 +343,19 @@ def remove(ports: list):
 
             case "Linux":
                 iptables_rm(f"_{action}_{protocol.lower()}-{port}", chain)
+                time.sleep(0.1)
 
     # clean knocks
     for action in ["alw", "blk"]:
         for port in ALL_KNOCKS:
-            del_port(action, "udp", port)
+            del_port(port, "udp", action)
 
     # clean ports
-    for svc in CONFIG:
-        cs = CONFIG[svc]  # todo: optimise?
-
+    for svc, cs in CONFIG.items():
         for action in ["alw", "blk"]:
-            for i in cs["ports"]:
-                port, protocols = parse_port(i)
-
-                for protocol in protocols:
-                    del_port(action, protocol, port, cs["chain"])
+            for port in cs["ports"]:
+                for protocol in port[1]:
+                    del_port(port[0], protocol, action, cs["chain"])
 
     log.info("cleaned")
 
@@ -354,20 +365,24 @@ def client(ip: str, services: list = [], timeout: int = 0):
     gate = time.time() + timeout
 
     while True:
-        for svc in services:
-            cs = CONFIG[svc]
+        seen = []
+        for svc, cs in CONFIG.items():
+            if cs["knocks"] in seen:  # dubs check
+                continue
+
+            seen.append(cs["knocks"])
 
             for port in cs["knocks"]:
+                log.info(f"[send] {svc} => {ip}:{port} ")
+
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                     sock.sendto(data, (ip, port))
-
-                log.info(f"[send] {svc} => {ip}:{port} ")
 
                 time.sleep(1)
 
             time.sleep(5)
 
-        if time.time() > gate:
+        if timeout and time.time() > gate:
             break
 
 
@@ -389,7 +404,7 @@ if __name__ == "__main__":
     add('-r', '--remove',             action='store_true',     help='remove all blocks / allows')
     add('-v', '--verbose',            action='store_true',     help='verbose output (traces)')   
     add('-b', '--block-at-exit',      action='store_true',     help='block all ports at exit')
-    add('-t', '--timeout',            type=int, default=60,    help='server: time for completing the entire sequence, client: time for knocking')
+    add('-t', '--timeout',            type=int, default=0,     help='server: time for completing the entire sequence, client: time for knocking')
 
     g = ap.add_argument_group('client options')
     add = g.add_argument
@@ -436,16 +451,19 @@ if __name__ == "__main__":
     if not CONFIG:
         die("config file is empty")
 
-    for svc in CONFIG:
-        cs = CONFIG[svc]
+    for svc, cs in CONFIG.items():
+        CONFIG[svc]["cmd_open"] = cs.get("cmd_open", [])
+        CONFIG[svc]["cmd_close"] = cs.get("cmd_close", [])
+        for cmd in ["cmd_open", "cmd_close"]:
+            if isinstance(cs[cmd], str):
+                CONFIG[svc][cmd] = [cs[cmd]]
 
-        for field in ["knocks", "ports"]:
-            if not cs.get(field, None):
-                die(f"no {field!r} field in {svc!r} service")
-
+        CONFIG[svc]["knocks"] = cs.get("knocks", [])
+        CONFIG[svc]["ports"] = expand_ports(cs.get("ports", []))
         CONFIG[svc]["allowed"] = cs.get("allowed", [])
         CONFIG[svc]["expires"] = cs.get("expires", 120)
         CONFIG[svc]["chain"] = cs.get("chain", "INPUT")
+
         CONFIG[svc]["timeout"] = 0
 
     log.debug("config: \n" + pf(CONFIG))
@@ -462,7 +480,7 @@ if __name__ == "__main__":
         else:
             ar.service = config_services
 
-        client(ar.ip, ar.service, ar.timeout or 9999999999)
+        client(ar.ip, ar.service, ar.timeout)
         die()
 
     #########################
@@ -547,13 +565,15 @@ if __name__ == "__main__":
     ## initial ports blocking
 
     def block_ports():
-        for svc in CONFIG:
-            cs = CONFIG[svc]
-            for i in cs["ports"]:
-                port, protocols = parse_port(i)
+        for svc, cs in CONFIG.items():
+            for port in cs["ports"]:
                 port_set(
-                    -port, protocols=protocols, chain=cs["chain"], allowed=cs["allowed"]
+                    -port[0],
+                    protocols=port[1],
+                    chain=cs["chain"],
+                    allowed=cs["allowed"],
                 )
+                time.sleep(0.1)
 
     block_ports()
 
