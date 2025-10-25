@@ -10,17 +10,11 @@ import subprocess as sp
 import sys
 import time
 from pathlib import Path
-from pprint import pformat as pf
+from pprint import pformat
 from threading import Thread
 from typing import List, Tuple
 
 import tomllib
-
-"""
-todo:
-    - ip in config
-    - make service examples (nssm, systemd --user)
-"""
 
 
 class NetshIPRangeBuilder:
@@ -28,20 +22,18 @@ class NetshIPRangeBuilder:
     FULL_END = int(ipaddress.IPv4Address("255.255.255.255"))
 
     def __init__(self, allowed_cidrs: List[str]):
-        """
-        allowed_cidrs: list of CIDR networks, for example [“192.168.0.0/16”, “10.0.0.0/8”]
-        """
+        # allowed_cidrs: list of CIDR networks, for example [“192.168.0.0/16”, “10.0.0.0/8”]
         self.allowed_cidrs = allowed_cidrs
 
     @staticmethod
     def _cidr_to_range(cidr: str) -> Tuple[int, int]:
-        """converts CIDR (e.g., 192.168.0.0/16) to a range (start_int, end_int)."""
+        # converts CIDR (e.g., 192.168.0.0/16) to a range (start_int, end_int).
         net = ipaddress.IPv4Network(cidr, strict=False)
         return int(net.network_address), int(net.broadcast_address)
 
     @staticmethod
     def _merge_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """merges overlapping or adjacent ranges."""
+        # merges overlapping or adjacent ranges.
         if not ranges:
             return []
         ranges_sorted = sorted(ranges, key=lambda x: x[0])
@@ -59,7 +51,7 @@ class NetshIPRangeBuilder:
     def _complement_ranges(
         self, allowed: List[Tuple[int, int]]
     ) -> List[Tuple[int, int]]:
-        """returns ranges that are not within the allowed CIDR."""
+        # returns ranges that are not within the allowed CIDR.
         allowed_merged = self._merge_ranges(allowed)
         res = []
         cur = self.FULL_START
@@ -73,7 +65,7 @@ class NetshIPRangeBuilder:
 
     @staticmethod
     def _format_ranges_for_netsh(ranges: List[Tuple[int, int]]) -> str:
-        """formats the list of ranges into a remoteip=... string."""
+        # formats the list of ranges into a remoteip=... string.
         if not ranges:
             return ""
         parts = [
@@ -82,7 +74,7 @@ class NetshIPRangeBuilder:
         return "remoteip=" + ",".join(parts)
 
     def build(self) -> str:
-        """main method: returns the string remoteip=... with prohibited ranges."""
+        # main method: returns the string remoteip=... with prohibited ranges.
         allowed = [self._cidr_to_range(cidr) for cidr in self.allowed_cidrs]
         forbidden = self._complement_ranges(allowed)
         return self._format_ranges_for_netsh(forbidden)
@@ -387,9 +379,9 @@ def client(ip: str, services: list = [], timeout: int = 0):
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                     sock.sendto(data, (ip, port))
 
-                time.sleep(1)
+                time.sleep(ar.knocks_delay)
 
-            time.sleep(5)
+            time.sleep(ar.services_delay)
 
         if timeout and time.time() > gate:
             break
@@ -410,16 +402,23 @@ if __name__ == "__main__":
     # fmt: off
     add("-c", "--config",             type=Path, default="",   help="config")
     add('-l', '--log',                type=str, default="",    help='write log to file')
-    add('-r', '--remove',             action='store_true',     help='remove all blocks / allows')
     add('-v', '--verbose',            action='store_true',     help='verbose output (traces)')   
+    add('-t', '--timeout',            type=int, default=0,     help='server: time for completing the entire sequence, client: time for knocking TODO')
+
+    g = ap.add_argument_group('server options')
+    add = g.add_argument
+
+    add('-r', '--remove',             action='store_true',     help='remove all blocks / allows')
     add('-b', '--block-at-exit',      action='store_true',     help='block all ports at exit')
-    add('-t', '--timeout',            type=int, default=0,     help='server: time for completing the entire sequence, client: time for knocking')
 
     g = ap.add_argument_group('client options')
     add = g.add_argument
 
-    add('-i', '--ip',      type=str, default='',            help='[toggle] ip to knock')
-    add('-s', '--service', nargs='+', type=str, default=[], help='services to knock (default: all)')
+    add('-i', '--ip',       type=str, default='',            help='[toggle] ip to knock')
+    add('-s', '--service',  nargs='+', type=str, default=[], help='services to knock (default: all)')
+    add('--knocks-delay',   type=int, default=1,             help='delay between knocks')
+    add('--services-delay', type=int, default=5,             help='delay between services')
+
     # fmt: on
 
     ar = ap.parse_args()
@@ -452,7 +451,7 @@ if __name__ == "__main__":
         die()
 
     if not ar.config.is_file():
-        die("invalid config path")
+        die(f"{ar.config!r} doesn't exist")
 
     with open(ar.config, "rb") as file:
         CONFIG = tomllib.load(file)
@@ -460,10 +459,11 @@ if __name__ == "__main__":
     if not CONFIG:
         die("config file is empty")
 
-    if "ip" in CONFIG:
-        if not ar.ip:
-            ar.ip = CONFIG["ip"]
-        del CONFIG["ip"]
+    for key in ("ip", "knocks_delay", "services_delay"):
+        if key in CONFIG:
+            if not getattr(ar, key):
+                setattr(ar, key, CONFIG[key])
+            del CONFIG[key]
 
     for svc, cs in CONFIG.items():
         CONFIG[svc]["cmd_open"] = cs.get("cmd_open", [])
@@ -477,7 +477,7 @@ if __name__ == "__main__":
 
         CONFIG[svc]["timeout"] = 0
 
-    log.debug("config: \n" + pf(CONFIG))
+    log.debug("config: \n" + pformat(CONFIG))
 
     #########################
     ## client mode
