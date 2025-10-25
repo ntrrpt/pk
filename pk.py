@@ -99,7 +99,14 @@ def die(reason: str | int = 0, code: int | None = None):
     sys.exit(code or int(bool(reason)))
 
 
-def expand_ports(ports: str | list) -> List[Tuple[int, list]]:
+def ports_fmt(ports: list) -> str:
+    return ", ".join(
+        str(port) if set(protos) == {"tcp", "udp"} else f"{port}/{protos[0]}"
+        for port, protos in ports
+    )
+
+
+def ports_expand(ports: str | list) -> List[Tuple[int, list]]:
     if isinstance(ports, str):
         ports = [p.strip() for p in ports.split(",") if p.strip()]
 
@@ -261,8 +268,7 @@ def check():
     for svc, cs in CONFIG.items():
         if cs["timeout"] and cs["timeout"] < time.time():
             if cs["ports"]:
-                ports = ", ".join(map(str, cs["ports"]))
-                log.warning(f"[expired] {svc}: {ports!r}")
+                log.warning(f"[expired] {svc}: {ports_fmt(cs['ports'])!r}")
 
                 for port in cs["ports"]:
                     port_set(
@@ -313,8 +319,9 @@ def server(port):
 
                 if not cs["timeout"]:
                     if cs["ports"]:
-                        ports = ", ".join(map(str, cs["ports"]))
-                        log.warning(f"[opening] {ports!r} for {cs['expires']}s")
+                        log.warning(
+                            f"[opening] {ports_fmt(cs['ports'])!r} for {cs['expires']}s"
+                        )
 
                         for _port in cs["ports"]:
                             port_set(
@@ -367,7 +374,9 @@ def client(ip: str, services: list = [], timeout: int = 0):
     while True:
         seen = []
         for svc, cs in CONFIG.items():
-            if cs["knocks"] in seen:  # dubs check
+            if services and svc not in services:  # svc chk
+                continue
+            if cs["knocks"] in seen:  # dubs chk
                 continue
 
             seen.append(cs["knocks"])
@@ -451,15 +460,17 @@ if __name__ == "__main__":
     if not CONFIG:
         die("config file is empty")
 
+    if "ip" in CONFIG:
+        if not ar.ip:
+            ar.ip = CONFIG["ip"]
+        del CONFIG["ip"]
+
     for svc, cs in CONFIG.items():
         CONFIG[svc]["cmd_open"] = cs.get("cmd_open", [])
         CONFIG[svc]["cmd_close"] = cs.get("cmd_close", [])
-        for cmd in ["cmd_open", "cmd_close"]:
-            if isinstance(cs[cmd], str):
-                CONFIG[svc][cmd] = [cs[cmd]]
 
         CONFIG[svc]["knocks"] = cs.get("knocks", [])
-        CONFIG[svc]["ports"] = expand_ports(cs.get("ports", []))
+        CONFIG[svc]["ports"] = ports_expand(cs.get("ports", []))
         CONFIG[svc]["allowed"] = cs.get("allowed", [])
         CONFIG[svc]["expires"] = cs.get("expires", 120)
         CONFIG[svc]["chain"] = cs.get("chain", "INPUT")
@@ -472,13 +483,9 @@ if __name__ == "__main__":
     ## client mode
 
     if ar.ip:
-        config_services = [svc for svc, _ in CONFIG.items()]
-        if ar.service:
-            for svc in ar.service:
-                if svc not in config_services:
-                    die(f"{svc} not found in config")
-        else:
-            ar.service = config_services
+        for svc in ar.service:
+            if svc not in CONFIG.keys():
+                die(f"{svc!r} not found in config")
 
         client(ar.ip, ar.service, ar.timeout)
         die()
