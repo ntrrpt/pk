@@ -1,0 +1,28 @@
+# ip to knock (overrides -c arg)
+#ip = 'localhost'
+
+[rdp] 
+knocks = [1111, 1111, 1111]
+ports = [3389] # tcp and udp by default
+expires = 2000
+
+[vnc]
+knocks = [6666, 5678, 1111]
+ports = '5900-5910' # can be a string
+expires = 1500
+
+[cpp]
+knocks = [1234, 5678, 4444]
+ports = [3923, '3921/tcp'] # can be both
+allowed = ['192.168.0.0/16'] # allow lan
+chain = 'DOCKER-USER' # for linux docker containers
+expires = 300
+
+[cmd] 
+knocks = [9999, 9999, 9999]
+cmd_open = ['touch hi.txt']
+cmd_close = ['rm -f hi.txt', 'touch bye.txt']
+expires = 10
+
+[null]
+knocks = [4444, 4444]
