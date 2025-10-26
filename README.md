@@ -27,7 +27,7 @@ sqq() {
 ```
 # windows install (via nssm):
 ```cmd
-rem <user> must have administrator rights or installed gsudo.
+rem user must have administrator rights or installed gsudo.
 nssm install pk py pk.py -c example.toml -l pk.log
 nssm set pk ObjectName .\<user> <pass>
 nssm start pk
