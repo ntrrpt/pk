@@ -1,4 +1,4 @@
-# ip to knock (overrides -c arg)
+# ip to knock (overrides -i arg)
 #ip = 'localhost'
 
 [rdp] 
