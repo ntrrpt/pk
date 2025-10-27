@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import ipaddress
 import logging
 import os
@@ -15,6 +16,11 @@ from threading import Thread
 from typing import List, Tuple
 
 import tomllib
+
+"""
+todo:
+    - toml override args
+"""
 
 
 class NetshIPRangeBuilder:
@@ -256,93 +262,18 @@ def iptables(
         )
 
 
-def check():
-    for svc, cs in CONFIG.items():
-        if cs["timeout"] and cs["timeout"] < time.time():
-            if cs["ports"]:
-                log.warning(f"[expired] {svc}: {ports_fmt(cs['ports'])!r}")
-
-                for port in cs["ports"]:
-                    port_set(
-                        -port[0],
-                        protocols=port[1],
-                        chain=cs["chain"],
-                        allowed=cs["allowed"],
-                    )
-
-            for cmd in cs["cmd_close"]:
-                log.warning(f"[expired] {svc}: {cmd!r}")
-                sp_exec(cmd)
-
-            CONFIG[svc]["timeout"] = 0
-
-
-def server(port):
-    global client_timeout
-
-    log.info(f"[lisening] {port}/udp")
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("", port))
-
-    while True:
-        data, addr = sock.recvfrom(1)
-        ip = addr[0]
-
-        log.info(f"[knock] {ip}:{port}")
-
-        knocks = CLIENT_KNOCKS.get(ip, [])
-        now = time.time()
-
-        # clean old attempts
-        if ar.timeout:
-            knocks = [k for k in knocks if now - k[1] < ar.timeout]
-
-        knocks.append((port, now))
-        CLIENT_KNOCKS[ip] = knocks
-
-        # seq checking
-        seq = [k[0] for k in knocks]
-
-        for svc, cs in CONFIG.items():
-            if seq[-len(cs["knocks"]) :] == cs["knocks"]:
-                log.info(f"[valid] {ip} => {svc}")
-                CLIENT_KNOCKS[ip] = []  # reset after success attempt
-
-                if not cs["timeout"]:
-                    if cs["ports"]:
-                        log.warning(
-                            f"[opening] {ports_fmt(cs['ports'])!r} for {cs['expires']}s"
-                        )
-
-                        for _port in cs["ports"]:
-                            port_set(
-                                _port[0],
-                                protocols=_port[1],
-                                chain=cs["chain"],
-                                allowed=cs["allowed"],
-                            )
-
-                    for cmd in cs["cmd_open"]:
-                        log.warning(f"[opening] exec: {cmd!r}")
-                        sp_exec(cmd)
-
-                CONFIG[svc]["timeout"] = now + cs["expires"]
-
-
 def remove(ports: list):
     def del_port(port: int, protocol: str, action: str, chain: str = "INPUT"):
         log.info(f"[rm] {action}_{protocol}-{port}")
 
-        match OS:
-            case "Windows":
-                sp_exec(
-                    f'{SUDO} netsh advfirewall firewall delete rule name="!_{action}_{protocol.upper()}-{port}"'
-                )
+        if OS == "Windows":
+            sp_exec(
+                f'{SUDO} netsh advfirewall firewall delete rule name="!_{action}_{protocol.upper()}-{port}"'
+            )
 
-            case "Linux":
-                iptables_rm(f"_{action}_{protocol.lower()}-{port}", chain)
-                time.sleep(0.1)
+        if OS == "Linux":
+            iptables_rm(f"_{action}_{protocol.lower()}-{port}", chain)
+            time.sleep(0.1)
 
     # clean knocks
     for action in ["alw", "blk"]:
@@ -359,32 +290,108 @@ def remove(ports: list):
     log.info("cleaned")
 
 
-def client(ip: str, services: list = [], timeout: int = 0):
-    data = b"\x00"
-    gate = time.time() + timeout
+def check():
+    def svc_off(cs):
+        if cs["ports"]:
+            log.warning(f"[closing] {svc}: {ports_fmt(cs['ports'])!r}")
+
+            for port in cs["ports"]:
+                port_set(
+                    -port[0],
+                    protocols=port[1],
+                    chain=cs["chain"],
+                    allowed=cs["allowed"],
+                )
+
+        for cmd in cs["cmd_close"]:
+            log.warning(f"[closing] {svc}: {cmd!r}")
+            sp_exec(cmd)
+
+    for svc, cs in CONFIG.items():
+        if cs["timeout"] > 0 and cs["timeout"] < time.time():
+            svc_off(cs)
+            CONFIG[svc]["timeout"] = 0
+
+
+def listener(port):
+    def svc_on(svc, cs):
+        if cs["ports"]:
+            log.warning(
+                f"[opening] {svc}: {ports_fmt(cs['ports'])!r} for {cs['expires']}s"
+            )
+
+            for _port in cs["ports"]:
+                port_set(
+                    _port[0],
+                    protocols=_port[1],
+                    chain=cs["chain"],
+                    allowed=cs["allowed"],
+                )
+
+        for cmd in cs["cmd_open"]:
+            log.warning(f"[opening] {svc}: {cmd!r}")
+            sp_exec(cmd)
+
+    log.info(f"[lisening] {port}/udp")
+
+    sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sck.bind(("", port))
 
     while True:
-        seen = []
+        data, addr = sck.recvfrom(1)
+        ip = addr[0]
+
+        log.info(f"[knock] {ip}:{port}")
+
+        knocks = CLIENT_KNOCKS.get(ip, [])
+        now = time.time()
+
+        # clean old attempts
+        if ar.timeout > -1:
+            knocks = [k for k in knocks if now - k[1] < ar.timeout]
+
+        knocks.append((port, now))
+        CLIENT_KNOCKS[ip] = knocks
+
+        # seq checking
+        seq = [k[0] for k in knocks]
+
         for svc, cs in CONFIG.items():
-            if services and svc not in services:  # svc chk
-                continue
-            if cs["knocks"] in seen:  # dubs chk
-                continue
+            if seq[-len(cs["knocks"]) :] == cs["knocks"]:
+                log.info(f"[valid] {ip} => {svc}")
+                CLIENT_KNOCKS[ip] = []  # reset after success attempt
 
-            seen.append(cs["knocks"])
+                match ar.mode:
+                    # toggle on / off w/o timeout (-1 => endless)
+                    case "toggle":
+                        if cs["timeout"] == 0:
+                            svc_on(svc, cs)
+                            CONFIG[svc]["timeout"] = -1
+                        elif cs["timeout"] == -1:
+                            CONFIG[svc]["timeout"] = 1
 
-            for port in cs["knocks"]:
-                log.info(f"[send] {svc} => {ip}:{port} ")
+                    # toggle on, extend time on seq
+                    case "extend":
+                        if cs["timeout"] == 0:
+                            svc_on(svc, cs)
+                        CONFIG[svc]["timeout"] = now + cs["expires"]
 
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                    sock.sendto(data, (ip, port))
+                    # toggle on / off, but timeout is enabled
+                    case "both":
+                        if cs["timeout"] == 0:
+                            svc_on(svc, cs)
+                            CONFIG[svc]["timeout"] = now + cs["expires"]
+                        elif cs["timeout"] > 0:
+                            CONFIG[svc]["timeout"] = 1
 
-                time.sleep(ar.knocks_delay)
 
-            time.sleep(ar.services_delay)
-
-        if timeout and time.time() > gate:
-            break
+def atexit_callback():
+    if ar.block_at_exit:
+        block_ports()
+        for port in ALL_KNOCKS:
+            port_set(-port, ["udp"])
+    else:
+        remove(CONFIG)
 
 
 if __name__ == "__main__":
@@ -396,29 +403,39 @@ if __name__ == "__main__":
     #########################
     ## args
 
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        formatter_class=lambda prog: argparse.RawTextHelpFormatter(
+            prog, max_help_position=35
+        )
+    )
     add = ap.add_argument
 
     # fmt: off
-    add("-c", "--config",             type=Path, default="",   help="config")
-    add('-l', '--log',                type=str, default="",    help='write log to file')
-    add('-v', '--verbose',            action='store_true',     help='verbose output (traces)')   
-    add('-t', '--timeout',            type=int, default=0,     help='server: time for completing the entire sequence, client: time for knocking TODO')
+    add("-c", "--config",  type=Path, default="", metavar='<file>', help="config")
+    add('-l', '--log',     type=str,  default="", metavar='<file>', help='write log to file')
+    add('-v', '--verbose', action='store_true',                     help='debug output')   
+    add('-t', '--timeout', type=int,  default=-1, metavar='<sec>',  help='''SERVER: time for completing the entire sequence
+CLIENT: time after which the knocking will stop
+(default: -1 => infinity)''')
 
     g = ap.add_argument_group('server options')
     add = g.add_argument
 
-    add('-r', '--remove',             action='store_true',     help='remove all blocks / allows')
-    add('-b', '--block-at-exit',      action='store_true',     help='block all ports at exit')
+    add('-r', '--remove',        action='store_true',                                    help='remove all blocks / allows')
+    add('-b', '--block-at-exit', action='store_true',                                    help='block all ports at exit')
+    add('-m', '--mode',          choices=['extend', 'toggle', 'both'], default='extend', help='''action on successful knock sequence:
+- extend: resets service timeout
+- toggle: enable / disable service (no timeouts)
+- both: same as toggle, but with timeouts
+(default: extend)''')
 
     g = ap.add_argument_group('client options')
     add = g.add_argument
 
-    add('-i', '--ip',       type=str, default='',            help='[toggle] ip to knock')
-    add('-s', '--service',  nargs='+', type=str, default=[], help='services to knock (default: all)')
-    add('--knocks-delay',   type=int, default=1,             help='delay between knocks')
-    add('--services-delay', type=int, default=5,             help='delay between services')
-
+    add('-i', '--ip',       type=str, default='',            metavar='',      help='[toggle] ip to knock')
+    add('-s', '--service',  type=str, default=[], nargs='+', metavar='',      help='services to knock (default: all)')
+    add('--knocks-delay',   type=int, default=1,             metavar='<sec>', help='delay between knocks')
+    add('--services-delay', type=int, default=5,             metavar='<sec>', help='delay between services')
     # fmt: on
 
     ar = ap.parse_args()
@@ -483,67 +500,92 @@ if __name__ == "__main__":
     ## client mode
 
     if ar.ip:
+        if not ar.service:
+            ar.service = CONFIG.keys()
+
         for svc in ar.service:
             if svc not in CONFIG.keys():
                 die(f"{svc!r} not found in config")
 
-        client(ar.ip, ar.service, ar.timeout)
-        die()
+        timeout = time.time() + ar.timeout
+
+        while True:
+            try:
+                for svc in ar.service:
+                    cs = CONFIG[svc]
+
+                    for i, port in enumerate(cs["knocks"], start=1):
+                        log.info(
+                            f"[send] {svc}: {i} / {len(cs['knocks'])} => {ar.ip}:{port} "
+                        )
+
+                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sck:
+                            sck.sendto(b"\x00", (ar.ip, port))
+
+                        time.sleep(ar.knocks_delay)
+
+                if ar.timeout != 0:
+                    time.sleep(ar.services_delay)
+
+                if ar.timeout > -1 and time.time() > timeout:
+                    die()
+
+            except KeyboardInterrupt:
+                die("KeyboardInterrupt")
 
     #########################
     ## os selecting
 
-    match OS:
-        case "Windows":
-            port_set = netsh
+    if OS == "Windows":
+        port_set = netsh
 
-            if not shutil.which("netsh"):
-                die("netsh not found (how)")
+        if not shutil.which("netsh"):
+            die("netsh not found (how)")
 
-            import ctypes
+        import ctypes
 
-            if not ctypes.windll.shell32.IsUserAnAdmin():
-                if shutil.which("sudo"):
-                    log.warning(
-                        "no admin rights, but sudo found (expect slow netsh starts)"
-                    )
-                    SUDO = "sudo"
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            if shutil.which("sudo"):
+                log.warning(
+                    "no admin rights, but sudo found (expect slow netsh starts)"
+                )
+                SUDO = "sudo"
 
-                else:
-                    s = "rerun as admin, or install gsudo"
-                    if shutil.which("choco"):
-                        s += " (via choco: choco install gsudo)"
-                    die(s)
+            else:
+                s = "rerun as admin, or install gsudo"
+                if shutil.which("choco"):
+                    s += " (via choco: 'choco install gsudo')"
+                die(s)
 
-        case "Linux":
-            port_set = iptables
+    elif OS == "Linux":
+        port_set = iptables
 
-            if not shutil.which("iptables"):
-                die("iptables not found")
+        if not shutil.which("iptables"):
+            die("iptables not found")
 
-            if os.getuid() != 0:
-                if not shutil.which("sudo"):
-                    die("sudo not found")
+        if os.getuid() != 0:
+            if not shutil.which("sudo"):
+                die("sudo not found")
 
-                try:
-                    sp.run(
-                        ["sudo", "-n", "true"],
-                        check=True,
-                        stdout=sp.DEVNULL,
-                        stderr=sp.DEVNULL,
-                    )
+            try:
+                sp.run(
+                    ["sudo", "-n", "true"],
+                    check=True,
+                    stdout=sp.DEVNULL,
+                    stderr=sp.DEVNULL,
+                )
 
-                    log.info("sudo mode on")
-                    SUDO = "sudo"
+                log.info("sudo mode on")
+                SUDO = "sudo"
 
-                except sp.CalledProcessError:
-                    die("sudo installed, but pass is required")
+            except sp.CalledProcessError:
+                die("sudo installed, but pass is required")
 
-                except Exception as e:
-                    die(f"sudo chk err: {e}")
+            except Exception as e:
+                die(f"sudo chk err: {e}")
 
-        case _:
-            die(f"platform {OS} is not supported")
+    else:
+        die(f"platform {OS} is not supported")
 
     #########################
     ## get all knocks from config
@@ -552,7 +594,7 @@ if __name__ == "__main__":
     ALL_KNOCKS = sorted(set(ALL_KNOCKS))  # remove dubs
 
     #########################
-    ## clean ports (-c)
+    ## clean ports (-r)
 
     if ar.remove:
         remove(CONFIG)
@@ -565,7 +607,7 @@ if __name__ == "__main__":
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             try:
                 sock.bind(("", port))
-            except OSError as e:
+            except Exception as e:
                 die(f"cannot bind {port}/udp: {e}")
 
     #########################
@@ -585,26 +627,23 @@ if __name__ == "__main__":
     block_ports()
 
     #########################
-    ## starting server
+    ## starting listeners
 
     for port in ALL_KNOCKS:
         port_set(port, ["udp"])
 
-        T = Thread(target=server, args=(port,), daemon=True)
+        T = Thread(target=listener, args=(port,), daemon=True)
         T.start()
 
     #########################
     ## main loop (check for expired services)
 
+    atexit.register(atexit_callback)
+
     try:
         while True:
             check()
-            time.sleep(1)
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
-        if ar.block_at_exit:
-            block_ports()
-            for port in ALL_KNOCKS:
-                port_set(-port, ["udp"])
-        else:
-            remove(CONFIG)
+        die("KeyboardInterrupt")
